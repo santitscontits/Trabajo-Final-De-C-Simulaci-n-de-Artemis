@@ -1,467 +1,426 @@
-/*
- * artemis.c
- * Lógica del simulador: física, eventos de la misión, puntaje y reportes.
- *
- * Organización del archivo:
- *   1) Física                    -> cálculos puros
- *   2) Lógica de la misión       -> la usan la consola Y la interfaz gráfica
- *   3) Versión de consola        -> printf + teclado (no la usa la interfaz gráfica)
- */
 #include <stdio.h>
-#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
 #include "artemis.h"
 #include "validaciones.h"
 
-/* ---------- Tablas constantes (arreglos) ---------- */
-static const Dificultad DIFICULTADES[NUM_DIFICULTADES] = {
-    /* nombre     g frenado  g impacto  correcciones */
-    { "Fácil",    5.0,       5.0,       3 },
-    { "Normal",   3.0,       3.5,       2 },
-    { "Difícil",  2.5,       3.0,       1 }
-};
+// Compatibilidad multiplataforma para lectura de teclado en tiempo real y pausas
+#ifdef _WIN32
+    #include <windows.h>
+    #include <conio.h>
+    #define DORMIR_MS(ms) Sleep(ms)
+    int teclaPresionada(void) { return _kbhit(); }
+    int obtenerTecla(void) { return _getch(); }
+#else
+    #include <unistd.h>
+    #include <termios.h>
+    #include <fcntl.h>
+    #define DORMIR_MS(ms) usleep((ms) * 1000)
 
-static const char *NOMBRES_EVENTOS[NUM_EVENTOS] = {
-    "Ventana de reingreso",
-    "Frenado aerodinámico",
-    "Paracaídas y amerizaje"
-};
-
-/* =====================================================================
- *                           1) FÍSICA
- * ===================================================================== */
-
-double energia_cinetica(double masa, double velocidad)
-{
-    return 0.5 * masa * velocidad * velocidad;
-}
-
-double energia_potencial(double masa, double altura)
-{
-    return masa * G_TERRESTRE * altura;
-}
-
-double energia_mecanica(double masa, double velocidad, double altura)
-{
-    return energia_cinetica(masa, velocidad) + energia_potencial(masa, altura);
-}
-
-/*
- * Teorema trabajo-energía: W_no_conservativas = Em_final - Em_inicial
- * Acá la única fuerza no conservativa es el rozamiento del aire (W < 0).
- */
-double calcular_trabajo_rozamiento(const DatosMision *d)
-{
-    double e_inicial = energia_mecanica(d->masa, d->v_inicial, d->h_inicial);
-    double e_final   = energia_mecanica(d->masa, d->v_paracaidas, d->h_paracaidas);
-
-    return e_final - e_inicial;
-}
-
-/* Desaceleración media = variación de velocidad / tiempo (valor positivo). */
-double calcular_desaceleracion_media(const DatosMision *d)
-{
-    return (d->v_inicial - d->v_paracaidas) / d->dt_frenado;
-}
-
-/*
- * Amerizaje: la cápsula frena de v_impacto a 0 recorriendo d_hundimiento.
- * Trabajo neto = variación de energía cinética:
- *      (m*g - F) * d = 0 - (1/2)*m*v^2   ->   F = m * (g + v^2 / (2*d))
- * (se desprecia el empuje del agua / flotación)
- */
-double calcular_fuerza_amerizaje(const DatosMision *d)
-{
-    double v2 = d->v_impacto * d->v_impacto;
-
-    return d->masa * (G_TERRESTRE + v2 / (2.0 * d->d_hundimiento));
-}
-
-EstadoAngulo clasificar_angulo(double gamma)
-{
-    if (gamma < GAMMA_MIN) {
-        return ANGULO_REBOTE;
-    }
-    if (gamma > GAMMA_MAX) {
-        return ANGULO_EXCESIVO;
-    }
-    return ANGULO_SEGURO;
-}
-
-/* Velocidad en cada instante suponiendo desaceleración media constante. */
-void generar_tabla_frenado(const DatosMision *d, PasoFrenado tabla[], int n)
-{
-    double a    = calcular_desaceleracion_media(d);
-    double paso = d->dt_frenado / n;
-
-    for (int i = 0; i <= n; i++) {
-        tabla[i].tiempo           = paso * i;
-        tabla[i].velocidad        = d->v_inicial - a * tabla[i].tiempo;
-        tabla[i].energia_cinetica = energia_cinetica(d->masa, tabla[i].velocidad);
-    }
-}
-
-/* =====================================================================
- *            2) LÓGICA DE LA MISIÓN (sin printf ni teclado)
- * ===================================================================== */
-
-const Dificultad *obtener_dificultad(int indice)
-{
-    if (indice < 0) {
-        indice = 0;
-    }
-    if (indice >= NUM_DIFICULTADES) {
-        indice = NUM_DIFICULTADES - 1;
-    }
-    return &DIFICULTADES[indice];
-}
-
-const char *nombre_evento(int indice)
-{
-    if (indice < 0 || indice >= NUM_EVENTOS) {
-        return "";
-    }
-    return NOMBRES_EVENTOS[indice];
-}
-
-const char *nombre_estado_evento(EstadoEvento estado)
-{
-    switch (estado) {
-    case EV_SUPERADO: return "SUPERADO";
-    case EV_FALLIDO:  return "FALLIDO";
-    default:          return "no alcanzado";
-    }
-}
-
-/* Validación cruzada: que los datos tengan sentido físico entre sí. */
-int datos_coherentes(const DatosMision *d, char *mensaje, int tam)
-{
-    const char *motivo = NULL;
-
-    if (d->h_inicial <= d->h_paracaidas) {
-        motivo = "La altitud de reingreso debe ser mayor que la de los paracaídas.";
-    } else if (d->v_inicial <= d->v_paracaidas) {
-        motivo = "La velocidad de reingreso debe ser mayor que la de apertura de paracaídas.";
-    } else if (d->v_paracaidas <= d->v_impacto) {
-        motivo = "La velocidad al abrir paracaídas debe ser mayor que la de impacto.";
-    }
-
-    if (motivo != NULL) {
-        if (mensaje != NULL && tam > 0) {
-            snprintf(mensaje, (size_t)tam, "%s", motivo);
+    int teclaPresionada(void) {
+        struct termios oldt, newt;
+        int ch;
+        int oldf;
+        tcgetattr(STDIN_FILENO, &oldt);
+        newt = oldt;
+        newt.c_lflag &= ~(ICANON | ECHO);
+        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+        oldf = fcntl(STDIN_FILENO, F_GETFL, 0);
+        fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);
+        ch = getchar();
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+        fcntl(STDIN_FILENO, F_SETFL, oldf);
+        if (ch != EOF) {
+            ungetc(ch, stdin);
+            return 1;
         }
         return 0;
     }
-    return 1;
+
+    int obtenerTecla(void) {
+        struct termios oldt, newt;
+        int ch;
+        tcgetattr(STDIN_FILENO, &oldt);
+        newt = oldt;
+        newt.c_lflag &= ~(ICANON | ECHO);
+        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+        ch = getchar();
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+        return ch;
+    }
+#endif
+
+void limpiarPantalla(void) {
+#ifdef _WIN32
+    system("cls");
+#else
+    system("clear");
+#endif
 }
 
-void iniciar_reporte(Reporte *rep, const Dificultad *dif)
-{
-    memset(rep, 0, sizeof *rep);
-    rep->dificultad = dif;
+void pausar(void) {
+    printf("\n%sPresione ENTER para continuar...%s", COLOR_CIAN, COLOR_RESET);
+    getchar();
 }
 
-EstadoAngulo resolver_angulo(Reporte *rep, const Dificultad *dif, double gamma)
-{
-    EstadoAngulo estado = clasificar_angulo(gamma);
+void mostrarBanner(void) {
+    printf("%s", COLOR_CIAN);
+    printf("====================================================================\n");
+    printf("   _   ___ _____ ___ __  __ ___ ___     ___  ___ ___ ___  _  _      \n");
+    printf("  /_\\ | _ \\_   _| __|  \\/  |_ _/ __|   / _ \\| _ \\_ _/ _ \\| \\| |     \n");
+    printf(" / _ \\|   / | | | _|| |\\/| || |\\__ \\  | (_) |   /| | (_) | .` |     \n");
+    printf("/_/ \\_\\_|_\\ |_| |___|_|  |_|___|___/   \\___/|_|_\\___\\___/|_|\\_|     \n");
+    printf("               SIMULADOR DE REINGRESO ATMOSFERICO                   \n");
+    printf("====================================================================\n");
+    printf("%s", COLOR_RESET);
+}
 
-    rep->gamma = gamma;
-    if (estado == ANGULO_SEGURO) {
-        rep->eventos[0] = EV_SUPERADO;
-    } else if (rep->correcciones_usadas >= dif->correcciones) {
-        rep->eventos[0] = EV_FALLIDO;
+void inicializarMision(MisionArtemis *mision) {
+    mision->altitud = 120.0;             // 120 km (Interfaz de entrada)
+    mision->velocidad = 39000.0;         // 39,000 km/h
+    mision->temperatura_escudo = 200.0;  // 200 °C iniciales
+    mision->integridad_escudo = 100.0;   // 100% intacto
+    mision->calidad_angulo = 2;          // Por defecto regular si se juega suelto
+    mision->drogue_desplegado = false;
+    mision->main_desplegado = false;
+    mision->mision_exitosa = false;
+}
+
+void mostrarTelemetria(const MisionArtemis *mision) {
+    printf("%s+------------------------------------------------------------------+\n", COLOR_AZUL);
+    printf("| TELEMETRIA DE CAPSULA ORION                                      |\n");
+    printf("+------------------------------------------------------------------+\n");
+    printf("| Altitud: %7.2f km        | Velocidad: %8.1f km/h            |\n", mision->altitud, mision->velocidad);
+    printf("| Temp. Escudo: %6.1f C     | Integridad Escudo: %5.1f%%           |\n", mision->temperatura_escudo, mision->integridad_escudo);
+    printf("+------------------------------------------------------------------+%s\n\n", COLOR_RESET);
+}
+
+int mostrarMenuPrincipal(void) {
+    limpiarPantalla();
+    mostrarBanner();
+    printf("\n%s  [ MENU DE CONTROL DE MISION ]%s\n\n", COLOR_BLANCO, COLOR_RESET);
+    printf("  %s1.%s Iniciar Mision Completa (Fases 1 -> 2 -> 3)\n", COLOR_VERDE, COLOR_RESET);
+    printf("  %s2.%s Practicar Fase 1: Angulo de Reingreso (Barra Espaciadora)\n", COLOR_CIAN, COLOR_RESET);
+    printf("  %s3.%s Practicar Fase 2: Frenado Aerodinamico (Gestion Termica)\n", COLOR_CIAN, COLOR_RESET);
+    printf("  %s4.%s Practicar Fase 3: Apertura de Paracaidas (Secuencia)\n", COLOR_CIAN, COLOR_RESET);
+    printf("  %s5.%s Salir del Simulador\n\n", COLOR_ROJO, COLOR_RESET);
+
+    return leerEnteroRango("  Seleccione una opcion [1-5]: ", 1, 5);
+}
+
+/* =========================================================================
+   MINIJUEGO 1: ANGULO DE REINGRESO
+   Barra de 40 posiciones:
+   - 60% Rojo (24 posiciones: 12 izq + 12 der)
+   - 25% Amarillo (10 posiciones: 5 izq + 5 der)
+   - 15% Verde (6 posiciones centrales)
+   ========================================================================= */
+bool jugarAnguloReingreso(MisionArtemis *mision) {
+    const int ANCHO_BARRA = 40;
+    int pos_aguja = 0;
+    int direccion = 1;
+    bool detenido = false;
+
+    limpiarPantalla();
+    mostrarBanner();
+    printf("\n%s[ FASE 1: CALIBRACION DE ANGULO DE REINGRESO ]%s\n", COLOR_AMARILLO, COLOR_RESET);
+    printf("Presione la %sBARRA ESPACIADORA%s para fijar el angulo de entrada.\n", COLOR_BLANCO, COLOR_RESET);
+    printf("Zona %sVERDE%s (15%%): Escudo optimo | %sAMARILLA%s (25%%): Normal | %sROJA%s (60%%): Critico\n\n",
+           COLOR_VERDE, COLOR_RESET, COLOR_AMARILLO, COLOR_RESET, COLOR_ROJO, COLOR_RESET);
+
+    // Ocultar cursor
+    printf("\033[?25l");
+
+    while (!detenido) {
+        // Dibujar línea de la aguja
+        printf("\r  ");
+        for (int i = 0; i < ANCHO_BARRA; i++) {
+            if (i == pos_aguja) {
+                printf("%sV%s", COLOR_BLANCO, COLOR_RESET);
+            } else {
+                printf(" ");
+            }
+        }
+        printf("\n  ");
+
+        // Dibujar barra de colores (60% Rojo, 25% Amarillo, 15% Verde)
+        // Indices: 0-11 Rojo (12), 12-16 Amarillo (5), 17-22 Verde (6), 23-27 Amarillo (5), 28-39 Rojo (12)
+        for (int i = 0; i < ANCHO_BARRA; i++) {
+            if (i >= 17 && i <= 22) {
+                printf("%s#%s", COLOR_VERDE, COLOR_RESET);
+            } else if ((i >= 12 && i <= 16) || (i >= 23 && i <= 27)) {
+                printf("%s=%s", COLOR_AMARILLO, COLOR_RESET);
+            } else {
+                printf("%s-%s", COLOR_ROJO, COLOR_RESET);
+            }
+        }
+        fflush(stdout);
+
+        // Verificar si se presionó la barra espaciadora (ASCII 32)
+        if (teclaPresionada()) {
+            int tecla = obtenerTecla();
+            if (tecla == ' ') {
+                detenido = true;
+                break;
+            }
+        }
+
+        DORMIR_MS(35); // Velocidad de oscilación de la aguja
+
+        // Mover cursor hacia arriba 1 línea para redibujar limpio
+        printf("\033[1A");
+
+        pos_aguja += direccion;
+        if (pos_aguja >= ANCHO_BARRA - 1 || pos_aguja <= 0) {
+            direccion *= -1;
+        }
+    }
+
+    // Mostrar cursor nuevamente
+    printf("\033[?25h\n\n");
+
+    // Evaluar zona donde cayó la aguja
+    if (pos_aguja >= 17 && pos_aguja <= 22) {
+        printf("%s[EXITO PERFECTO]%s Angulo de reingreso optimo (6.2 grados).\n", COLOR_VERDE, COLOR_RESET);
+        printf("Ventaja tactica: Escudo termico reforzado y velocidad inicial controlada.\n");
+        mision->calidad_angulo = 3;
+        mision->integridad_escudo = 100.0;
+        mision->velocidad = 36000.0;
+    } else if ((pos_aguja >= 12 && pos_aguja <= 16) || (pos_aguja >= 23 && pos_aguja <= 27)) {
+        printf("%s[ACEPTABLE]%s Angulo ligeramente desviado. El escudo sufrira estres adicional.\n", COLOR_AMARILLO, COLOR_RESET);
+        mision->calidad_angulo = 2;
+        mision->integridad_escudo = 85.0;
+        mision->velocidad = 39000.0;
     } else {
-        rep->correcciones_usadas++;
+        printf("%s[ALERTA CRITICA]%s Angulo muy pronunciado (Zona Roja).\n", COLOR_ROJO, COLOR_RESET);
+        printf("Penalizacion: Temperatura inicial elevada e integridad del escudo al 65%%.\n");
+        mision->calidad_angulo = 1;
+        mision->integridad_escudo = 65.0;
+        mision->temperatura_escudo = 650.0;
+        mision->velocidad = 42000.0;
     }
-    return estado;
+
+    pausar();
+    return true;
 }
 
-void resolver_frenado(const DatosMision *d, const Dificultad *dif, Reporte *rep)
-{
-    rep->energia_inicial  = energia_mecanica(d->masa, d->v_inicial, d->h_inicial);
-    rep->energia_final    = energia_mecanica(d->masa, d->v_paracaidas, d->h_paracaidas);
-    rep->trabajo_roz      = calcular_trabajo_rozamiento(d);
-    rep->desaceleracion   = calcular_desaceleracion_media(d);
-    rep->desaceleracion_g = rep->desaceleracion / G_TERRESTRE;
-    generar_tabla_frenado(d, rep->tabla, NUM_PASOS_FRENADO);
+/* =========================================================================
+   MINIJUEGO 2: FRENADO AERODINAMICO
+   Objetivo: Bajar velocidad debajo de 2500 km/h antes de llegar a 10 km
+   sin que la temperatura supere los 2800°C o la integridad llegue a 0%.
+   ========================================================================= */
+bool jugarFrenadoAerodinamico(MisionArtemis *mision) {
+    int turno = 1;
+    const double TEMP_MAXIMA = 2800.0;
+    const double VELOCIDAD_OBJETIVO = 2500.0;
+    const double ALTITUD_LIMITE_FASE = 10.0;
 
-    rep->eventos[1] = (rep->desaceleracion_g <= dif->limite_g_frenado) ? EV_SUPERADO : EV_FALLIDO;
+    while (mision->altitud > ALTITUD_LIMITE_FASE) {
+        limpiarPantalla();
+        mostrarBanner();
+        printf("\n%s[ FASE 2: FRENADO AERODINAMICO - TURNO %d ]%s\n", COLOR_AMARILLO, turno, COLOR_RESET);
+        mostrarTelemetria(mision);
+
+        // Barra visual de temperatura del escudo
+        int barras_temp = (int)((mision->temperatura_escudo / TEMP_MAXIMA) * 30);
+        if (barras_temp > 30) barras_temp = 30;
+        printf("  Carga Termica Escudo: [");
+        for (int i = 0; i < 30; i++) {
+            if (i < barras_temp) {
+                if (barras_temp > 22) printf("%s#%s", COLOR_ROJO, COLOR_RESET);
+                else if (barras_temp > 14) printf("%s#%s", COLOR_AMARILLO, COLOR_RESET);
+                else printf("%s#%s", COLOR_VERDE, COLOR_RESET);
+            } else {
+                printf(".");
+            }
+        }
+        printf("] %.0f / %.0f C\n\n", mision->temperatura_escudo, TEMP_MAXIMA);
+
+        printf("  Seleccione perfil de inclinacion de la capsula:\n");
+        printf("  %s1. Frenado Agresivo%s   (Desacelera mucho | Dispara temperatura y desgaste)\n", COLOR_ROJO, COLOR_RESET);
+        printf("  %s2. Frenado Balanceado%s (Desacelera normal | Calor moderado)\n", COLOR_AMARILLO, COLOR_RESET);
+        printf("  %s3. Planeo Suave%s      (Desacelera poco  | Enfria el escudo termico)\n\n", COLOR_VERDE, COLOR_RESET);
+
+        int decision = leerEnteroRango("  Orden de vuelo [1-3]: ", 1, 3);
+
+        // Física simplificada del turno
+        double factor_escudo = (mision->calidad_angulo == 3) ? 0.85 : (mision->calidad_angulo == 1 ? 1.25 : 1.0);
+
+        if (decision == 1) {
+            mision->velocidad -= 7800.0;
+            mision->altitud -= 16.0;
+            mision->temperatura_escudo += 680.0 * factor_escudo;
+            mision->integridad_escudo -= 14.0 * factor_escudo;
+        } else if (decision == 2) {
+            mision->velocidad -= 5200.0;
+            mision->altitud -= 18.0;
+            mision->temperatura_escudo += 260.0 * factor_escudo;
+            mision->integridad_escudo -= 5.0 * factor_escudo;
+        } else {
+            mision->velocidad -= 2400.0;
+            mision->altitud -= 22.0;
+            mision->temperatura_escudo -= 320.0;
+            if (mision->temperatura_escudo < 200.0) mision->temperatura_escudo = 200.0;
+        }
+
+        if (mision->velocidad < 800.0) mision->velocidad = 800.0;
+
+        // Verificar condiciones de derrota térmica
+        if (mision->temperatura_escudo >= TEMP_MAXIMA || mision->integridad_escudo <= 0.0) {
+            limpiarPantalla();
+            mostrarBanner();
+            printf("\n%s[ FALLO CATASTROFICO ]%s\n", COLOR_ROJO, COLOR_RESET);
+            printf("El escudo termico ha colapsado por sobrecalentamiento (%.1f C).\n", mision->temperatura_escudo);
+            printf("La capsula Orion se ha desintegrado en la atmosfera.\n");
+            pausar();
+            return false;
+        }
+
+        turno++;
+    }
+
+    // Evaluar velocidad al salir de la fase atmosférica alta (10 km)
+    limpiarPantalla();
+    mostrarBanner();
+    if (mision->velocidad > VELOCIDAD_OBJETIVO) {
+        printf("\n%s[ FALLO DE FRENADO ]%s\n", COLOR_ROJO, COLOR_RESET);
+        printf("Llegaste a 10 km de altitud con una velocidad excesiva (%.1f km/h).\n", mision->velocidad);
+        printf("Es imposible desplegar paracaidas a esta velocidad. Impacto inminente.\n");
+        pausar();
+        return false;
+    }
+
+    printf("\n%s[ FRENADO AERODINAMICO COMPLETADO ]%s\n", COLOR_VERDE, COLOR_RESET);
+    printf("Velocidad reducida a %.1f km/h. Listo para secuencia de paracaidas.\n", mision->velocidad);
+    pausar();
+    return true;
 }
 
-void resolver_amerizaje(const DatosMision *d, const Dificultad *dif, Reporte *rep)
-{
-    rep->fuerza_impacto  = calcular_fuerza_amerizaje(d);
-    rep->fuerza_en_pesos = rep->fuerza_impacto / (d->masa * G_TERRESTRE);
+/* =========================================================================
+   MINIJUEGO 3: APERTURA DE PARACAIDAS
+   Secuencia obligatoria:
+   1. Drogue Chutes (Estabilizacion): Seguro desplegar debajo de 1200 km/h y < 8.5 km
+   2. Main Chutes (Principales): Seguro desplegar debajo de 350 km/h y < 3.5 km
+   ========================================================================= */
+bool jugarAperturaParacaidas(MisionArtemis *mision) {
+    // Asegurar condiciones iniciales coherentes si se juega de forma independiente
+    if (mision->altitud > 10.0) mision->altitud = 10.0;
+    if (mision->velocidad > 2500.0) mision->velocidad = 1400.0;
+    mision->drogue_desplegado = false;
+    mision->main_desplegado = false;
 
-    rep->eventos[2] = (rep->fuerza_en_pesos <= dif->limite_g_impacto) ? EV_SUPERADO : EV_FALLIDO;
-}
+    while (mision->altitud > 0.0) {
+        limpiarPantalla();
+        mostrarBanner();
+        printf("\n%s[ FASE 3: DESCENSO FINAL Y PARACAIDAS ]%s\n", COLOR_AMARILLO, COLOR_RESET);
+        mostrarTelemetria(mision);
 
-void calcular_puntaje(Reporte *rep)
-{
-    int puntos = 0;
-    int superados = 0;
+        // Calcular presión dinámica relativa (Q)
+        double presion_dinamica = (mision->velocidad * mision->velocidad) / 10000.0;
 
-    if (rep->eventos[0] == EV_SUPERADO) {
-        puntos += PUNTOS_EVENTO - PENALIZACION_CORR * rep->correcciones_usadas;
-        if (puntos < 0) {
-            puntos = 0;
+        printf("  Estado Paracaidas Estabilizacion (Drogue): %s\n",
+               mision->drogue_desplegado ? COLOR_VERDE "[DESPLEGADO]" COLOR_RESET : COLOR_ROJO "[PLEGADO]" COLOR_RESET);
+        printf("  Estado Paracaidas Principales (Main):      %s\n",
+               mision->main_desplegado ? COLOR_VERDE "[DESPLEGADO]" COLOR_RESET : COLOR_ROJO "[PLEGADO]" COLOR_RESET);
+        printf("  Presion Dinamica (Tension): %.1f kPa ", presion_dinamica);
+
+        if (presion_dinamica > 140.0) printf("%s(PELIGRO EXTREMO - NO ABRIR)%s\n\n", COLOR_ROJO, COLOR_RESET);
+        else if (presion_dinamica > 15.0) printf("%s(APTO PARA DROGUE CHUTES)%s\n\n", COLOR_AMARILLO, COLOR_RESET);
+        else printf("%s(APTO PARA MAIN CHUTES)%s\n\n", COLOR_VERDE, COLOR_RESET);
+
+        printf("  Acciones disponibles:\n");
+        printf("  1. Esperar / Continuar descenso libre\n");
+        printf("  2. Desplegar Paracaidas de Estabilizacion (Drogue Chutes)\n");
+        printf("  3. Desplegar Paracaidas Principales (Main Chutes)\n\n");
+
+        int accion = leerEnteroRango("  Seleccione accion [1-3]: ", 1, 3);
+
+        if (accion == 2) {
+            if (mision->drogue_desplegado) {
+                printf("\n%s[!] Los paracaidas Drogue ya estan desplegados.%s\n", COLOR_AMARILLO, COLOR_RESET);
+                DORMIR_MS(1000);
+            } else if (mision->velocidad > 1200.0) {
+                limpiarPantalla();
+                mostrarBanner();
+                printf("\n%s[ FALLO ESTRUCTURAL ]%s\n", COLOR_ROJO, COLOR_RESET);
+                printf("Desplegaste los Drogue Chutes demasiado pronto (%.1f km/h).\n", mision->velocidad);
+                printf("La presion dinamica destrozo las cuerdas. Caida libre sin control.\n");
+                pausar();
+                return false;
+            } else {
+                mision->drogue_desplegado = true;
+                printf("\n%s[OK] Drogue Chutes desplegados correctamente. Estabilizando nave...%s\n", COLOR_VERDE, COLOR_RESET);
+                DORMIR_MS(1200);
+            }
+        } else if (accion == 3) {
+            if (!mision->drogue_desplegado) {
+                limpiarPantalla();
+                mostrarBanner();
+                printf("\n%s[ FALLO DE SECUENCIA ]%s\n", COLOR_ROJO, COLOR_RESET);
+                printf("Intentaste abrir los Main Chutes sin estabilizar la nave con los Drogue.\n");
+                printf("Los paracaidas principales se enredaron y colapsaron.\n");
+                pausar();
+                return false;
+            } else if (mision->main_desplegado) {
+                printf("\n%s[!] Los paracaidas principales ya estan desplegados.%s\n", COLOR_AMARILLO, COLOR_RESET);
+                DORMIR_MS(1000);
+            } else if (mision->velocidad > 360.0) {
+                limpiarPantalla();
+                mostrarBanner();
+                printf("\n%s[ FALLO ESTRUCTURAL ]%s\n", COLOR_ROJO, COLOR_RESET);
+                printf("Velocidad demasiado alta (%.1f km/h) para los Main Chutes.\n", mision->velocidad);
+                printf("La tension desgarro la tela de los paracaidas principales.\n");
+                pausar();
+                return false;
+            } else {
+                mision->main_desplegado = true;
+                printf("\n%s[OK] Main Chutes desplegados. Frenando para amerizaje seguro...%s\n", COLOR_VERDE, COLOR_RESET);
+                DORMIR_MS(1200);
+            }
+        }
+
+        // Actualizar física de descenso por ciclo
+        if (mision->main_desplegado) {
+            mision->velocidad -= 140.0;
+            if (mision->velocidad < 28.0) mision->velocidad = 28.0; // Velocidad segura de amerizaje (~28 km/h)
+            mision->altitud -= 1.2;
+        } else if (mision->drogue_desplegado) {
+            mision->velocidad -= 280.0;
+            if (mision->velocidad < 240.0) mision->velocidad = 240.0; // Velocidad terminal con drogue
+            mision->altitud -= 1.8;
+        } else {
+            // Caída libre aerodinámica
+            mision->velocidad -= 180.0;
+            if (mision->velocidad < 650.0) mision->velocidad = 650.0;
+            mision->altitud -= 2.2;
         }
     }
-    if (rep->eventos[1] == EV_SUPERADO) {
-        puntos += PUNTOS_EVENTO;
-    }
-    if (rep->eventos[2] == EV_SUPERADO) {
-        puntos += PUNTOS_EVENTO;
-    }
 
-    for (int i = 0; i < NUM_EVENTOS; i++) {
-        if (rep->eventos[i] == EV_SUPERADO) {
-            superados++;
-        }
-    }
-    rep->exito = (superados == NUM_EVENTOS);
-
-    if (rep->exito && rep->correcciones_usadas == 0) {
-        puntos += BONUS_SIN_CORREC;
-    }
-    rep->puntaje = puntos;
-}
-
-/* =====================================================================
- *        3) VERSIÓN DE CONSOLA (printf + teclado)
- * ===================================================================== */
-
-void cargar_datos_por_defecto(DatosMision *d)
-{
-    d->masa          = MASA_CAPSULA;
-    d->v_inicial     = V_REINGRESO;
-    d->h_inicial     = H_REINGRESO;
-    d->v_paracaidas  = V_PARACAIDAS;
-    d->h_paracaidas  = H_PARACAIDAS;
-    d->v_impacto     = V_IMPACTO;
-    d->dt_frenado    = DT_FRENADO;
-    d->d_hundimiento = D_HUNDIMIENTO;
-}
-
-void ingresar_datos_mision(DatosMision *d)
-{
-    char mensaje[TAM_MENSAJE];
-
-    while (1) {
-        puts("\n--- Ingreso de datos de la misión ---");
-        d->masa          = leer_double("Masa de la cápsula (kg)",            1000.0, 50000.0);
-        d->v_inicial     = leer_double("Velocidad de reingreso (m/s)",        100.0, 15000.0);
-        d->h_inicial     = leer_double("Altitud de reingreso (m)",          10000.0, 200000.0);
-        d->v_paracaidas  = leer_double("Velocidad al abrir paracaídas (m/s)",   1.0, 200.0);
-        d->h_paracaidas  = leer_double("Altitud de paracaídas (m)",           100.0, 10000.0);
-        d->v_impacto     = leer_double("Velocidad de impacto (m/s)",            0.5, 30.0);
-        d->dt_frenado    = leer_double("Duración del frenado máximo (s)",      10.0, 2000.0);
-        d->d_hundimiento = leer_double("Hundimiento en el agua (m)",            0.1, 10.0);
-
-        if (datos_coherentes(d, mensaje, TAM_MENSAJE)) {
-            return;
-        }
-        mostrar_advertencia(mensaje);
-    }
-}
-
-const Dificultad *seleccionar_dificultad(void)
-{
-    puts("\n--- Dificultad ---");
-    for (int i = 0; i < NUM_DIFICULTADES; i++) {
-        printf("  %d) %s | máx. %.1f g en frenado | máx. %.1fx peso en impacto | correcciones: %d\n",
-               i + 1, DIFICULTADES[i].nombre,
-               DIFICULTADES[i].limite_g_frenado,
-               DIFICULTADES[i].limite_g_impacto,
-               DIFICULTADES[i].correcciones);
-    }
-    int opcion = leer_entero("Elegí la dificultad", 1, NUM_DIFICULTADES);
-
-    return &DIFICULTADES[opcion - 1];
-}
-
-static void explicar_angulo(EstadoAngulo estado)
-{
-    switch (estado) {
-    case ANGULO_REBOTE:
-        puts("  -> gamma demasiado chico: REBOTE ATMOSFÉRICO.");
-        puts("     La cápsula rebota en las capas altas y vuelve al espacio sin frenar lo suficiente.");
-        break;
-    case ANGULO_EXCESIVO:
-        puts("  -> gamma demasiado grande: DESACELERACIÓN EXCESIVA.");
-        puts("     El frenado es tan brusco que supera lo que soportan la tripulación y el escudo térmico.");
-        break;
-    default:
-        puts("  -> Ángulo dentro de la ventana segura.");
-        break;
-    }
-}
-
-static void mostrar_tabla_frenado(const PasoFrenado tabla[], int n)
-{
-    puts("\n    t [s]     v [m/s]      Ec [J]");
-    puts("  ------------------------------------");
-    for (int i = 0; i < n; i++) {
-        printf("  %7.1f  %9.1f  %12.4e\n",
-               tabla[i].tiempo, tabla[i].velocidad, tabla[i].energia_cinetica);
-    }
-}
-
-void ejecutar_mision(const DatosMision *d, const Dificultad *dif, Reporte *rep)
-{
-    EstadoAngulo estado;
-    double gamma;
-
-    iniciar_reporte(rep, dif);
-
-    /* ---------- EVENTO 1: ventana de reingreso ---------- */
-    printf("\n===== EVENTO 1: %s =====\n", NOMBRES_EVENTOS[0]);
-    printf("Ventana segura: %.1f° <= gamma <= %.1f°  |  Correcciones disponibles: %d\n",
-           GAMMA_MIN, GAMMA_MAX, dif->correcciones);
-
-    while (rep->eventos[0] == EV_PENDIENTE) {
-        gamma  = leer_double("Ángulo de reingreso gamma (grados)", 0.0, 90.0);
-        estado = resolver_angulo(rep, dif, gamma);
-        explicar_angulo(estado);
-
-        if (rep->eventos[0] == EV_FALLIDO) {
-            puts("  Sin propelente para más correcciones: SE PIERDE LA MISIÓN.");
-        } else if (estado != ANGULO_SEGURO) {
-            printf("  Corrección usada (%d/%d). Probá con otro ángulo.\n",
-                   rep->correcciones_usadas, dif->correcciones);
-        }
-    }
-    if (rep->eventos[0] == EV_FALLIDO) {
-        calcular_puntaje(rep);
-        return;
-    }
-
-    /* ---------- EVENTO 2: frenado aerodinámico ---------- */
-    printf("\n===== EVENTO 2: %s =====\n", NOMBRES_EVENTOS[1]);
-    resolver_frenado(d, dif, rep);
-
-    mostrar_tabla_frenado(rep->tabla, TAM_TABLA);
-    printf("\n  Trabajo del rozamiento : %.4e J\n", rep->trabajo_roz);
-    printf("  Desaceleración media   : %.2f m/s^2 = %.2f g  (límite %.1f g)\n",
-           rep->desaceleracion, rep->desaceleracion_g, dif->limite_g_frenado);
-
-    if (rep->eventos[1] == EV_SUPERADO) {
-        puts("  -> La tripulación soporta el frenado. EVENTO SUPERADO.");
+    // Evaluación de impacto / amerizaje (Altitud <= 0)
+    limpiarPantalla();
+    mostrarBanner();
+    if (mision->main_desplegado && mision->velocidad <= 45.0) {
+        mision->mision_exitosa = true;
+        printf("\n%s====================================================================\n", COLOR_VERDE);
+        printf("                  AMERIZAJE EXITOSO EN EL OCEANO                    \n");
+        printf("====================================================================%s\n", COLOR_RESET);
+        printf("Velocidad de contacto: %.1f km/h (Dentro del margen seguro).\n", mision->velocidad);
+        printf("Integridad final del escudo termico: %.1f%%\n", mision->integridad_escudo);
+        printf("La tripulacion de Artemis ha regresado a salvo a la Tierra.\n");
+        pausar();
+        return true;
     } else {
-        puts("  -> Carga de g excesiva para la tripulación. EVENTO FALLIDO.");
-        calcular_puntaje(rep);
-        return;
-    }
-
-    /* ---------- EVENTO 3: paracaídas y amerizaje ---------- */
-    printf("\n===== EVENTO 3: %s =====\n", NOMBRES_EVENTOS[2]);
-    printf("  Paracaídas abiertos a %.1f m con %.1f m/s. Impacto a %.1f m/s, hundimiento %.2f m.\n",
-           d->h_paracaidas, d->v_paracaidas, d->v_impacto, d->d_hundimiento);
-
-    resolver_amerizaje(d, dif, rep);
-
-    printf("  Fuerza promedio del agua: %.1f N = %.2f veces el peso (límite %.1fx)\n",
-           rep->fuerza_impacto, rep->fuerza_en_pesos, dif->limite_g_impacto);
-
-    if (rep->eventos[2] == EV_SUPERADO) {
-        puts("  -> La estructura resiste el amerizaje. EVENTO SUPERADO.");
-    } else {
-        puts("  -> La estructura no resiste el impacto. EVENTO FALLIDO.");
-    }
-
-    calcular_puntaje(rep);
-}
-
-void mostrar_reglas(void)
-{
-    puts("\n================ REGLAS DEL JUEGO ================");
-    puts("Sos el director de vuelo del reingreso de la cápsula Orion (Artemis).");
-    puts("La misión tiene 3 eventos y se juega por turnos:");
-    puts("  1) Ventana de reingreso: elegís el ángulo gamma. Debe estar entre");
-    printf("     %.1f° y %.1f°. Si no, hay rebote atmosférico (muy chico) o\n", GAMMA_MIN, GAMMA_MAX);
-    puts("     desaceleración excesiva (muy grande). Cada error gasta una corrección.");
-    puts("  2) Frenado aerodinámico: se calcula el trabajo del rozamiento y la");
-    puts("     desaceleración media. Si supera el límite de g, la tripulación no resiste.");
-    puts("  3) Paracaídas y amerizaje: se calcula la fuerza promedio del agua.");
-    puts("     Si supera el límite, la estructura falla.");
-    puts("Puntaje: 300 por evento (-100 por cada corrección usada) + 100 de bonus");
-    puts("si completás todo sin correcciones. Máximo: 1000 puntos.");
-    puts("La dificultad cambia los límites y las correcciones disponibles.");
-}
-
-void mostrar_datos(const DatosMision *d)
-{
-    puts("\n--- Datos actuales de la misión ---");
-    printf("  Masa de la cápsula        : %.1f kg\n", d->masa);
-    printf("  Velocidad de reingreso    : %.1f m/s\n", d->v_inicial);
-    printf("  Altitud de reingreso      : %.1f m\n", d->h_inicial);
-    printf("  Velocidad al abrir paracaídas: %.1f m/s\n", d->v_paracaidas);
-    printf("  Altitud de paracaídas     : %.1f m\n", d->h_paracaidas);
-    printf("  Velocidad de impacto      : %.1f m/s\n", d->v_impacto);
-    printf("  Duración frenado máximo   : %.1f s\n", d->dt_frenado);
-    printf("  Hundimiento en el agua    : %.2f m\n", d->d_hundimiento);
-}
-
-/* Respuestas analíticas a las 4 preguntas del enunciado. */
-void mostrar_analisis(const DatosMision *d, double gamma)
-{
-    double ei = energia_mecanica(d->masa, d->v_inicial, d->h_inicial);
-    double ef = energia_mecanica(d->masa, d->v_paracaidas, d->h_paracaidas);
-    double w  = calcular_trabajo_rozamiento(d);
-    double a  = calcular_desaceleracion_media(d);
-    double f  = calcular_fuerza_amerizaje(d);
-
-    puts("\n================ ANÁLISIS ANALÍTICO ================");
-
-    puts("\n1) Trabajo de la fuerza de rozamiento (W_roz = Em_final - Em_inicial)");
-    printf("   Em inicial = %.4e J\n", ei);
-    printf("   Em final   = %.4e J\n", ef);
-    printf("   W_roz      = %.4e J  (negativo: el aire disipa energía)\n", w);
-    printf("   Energía disipada: %.3f %% de la inicial\n", 100.0 * (-w) / ei);
-
-    puts("\n2) Desaceleración media durante el frenado");
-    printf("   a = (vi - vf) / dt = %.2f m/s^2 = %.2f g\n", a, a / G_TERRESTRE);
-
-    puts("\n3) Fuerza promedio del agua en el amerizaje  F = m (g + v^2 / 2d)");
-    printf("   F = %.1f N = %.2f veces el peso de la nave\n", f, f / (d->masa * G_TERRESTRE));
-
-    printf("\n4) Ángulo de reingreso gamma = %.2f° (ventana segura: %.1f° a %.1f°)\n",
-           gamma, GAMMA_MIN, GAMMA_MAX);
-    switch (clasificar_angulo(gamma)) {
-    case ANGULO_SEGURO:
-        puts("   Dentro de la ventana: el frenado es controlado.");
-        break;
-    case ANGULO_EXCESIVO:
-        puts("   gamma > 7,0°: trayectoria muy empinada, la nave se mete rápido en aire denso.");
-        puts("   Desaceleración excesiva y calentamiento extremo (riesgo para tripulación y escudo).");
-        break;
-    default:
-        puts("   gamma < 5,5°: trayectoria muy tendida, la nave no es capturada por la atmósfera.");
-        puts("   Rebote atmosférico: la nave vuelve al espacio y se pierde el reingreso.");
-        break;
+        printf("\n%s[ IMPACTO FATAL CONTRA EL OCEANO ]%s\n", COLOR_ROJO, COLOR_RESET);
+        printf("La capsula impacto el agua a %.1f km/h sin frenado completo.\n", mision->velocidad);
+        pausar();
+        return false;
     }
 }
 
-void mostrar_reporte(const Reporte *r)
-{
-    puts("\n=============== REPORTE FINAL DE LA MISIÓN ===============");
-    printf("Dificultad           : %s\n", r->dificultad->nombre);
-    printf("Ángulo de reingreso  : %.2f°\n", r->gamma);
-    printf("Correcciones usadas  : %d de %d\n", r->correcciones_usadas, r->dificultad->correcciones);
+void ejecutarMisionCompleta(MisionArtemis *mision) {
+    inicializarMision(mision);
 
-    for (int i = 0; i < NUM_EVENTOS; i++) {
-        printf("Evento %d (%s): %s\n", i + 1, nombre_evento(i), nombre_estado_evento(r->eventos[i]));
-    }
-
-    if (r->eventos[1] != EV_PENDIENTE) {
-        printf("Trabajo del rozamiento: %.4e J\n", r->trabajo_roz);
-        printf("Desaceleración media  : %.2f g\n", r->desaceleracion_g);
-    }
-    if (r->eventos[2] != EV_PENDIENTE) {
-        printf("Fuerza en amerizaje   : %.1f N (%.2fx el peso)\n", r->fuerza_impacto, r->fuerza_en_pesos);
-    }
-
-    printf("\nPUNTAJE: %d / %d\n", r->puntaje,
-           NUM_EVENTOS * PUNTOS_EVENTO + BONUS_SIN_CORREC);
-    puts(r->exito ? "RESULTADO: ¡MISIÓN EXITOSA! La tripulación está a salvo."
-                  : "RESULTADO: MISIÓN FALLIDA.");
+    if (!jugarAnguloReingreso(mision)) return;
+    if (!jugarFrenadoAerodinamico(mision)) return;
+    jugarAperturaParacaidas(mision);
 }
